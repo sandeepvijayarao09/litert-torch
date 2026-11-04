@@ -217,7 +217,7 @@ class PatchTest(parameterized.TestCase):
     config = _get_dummy_lfm2_config()
     conv = patch.short_conv_lib.Lfm2ShortConv(config, layer_idx=0)
 
-    expected_shape = (1, config.hidden_size, config.conv_L_cache - 1)
+    expected_shape = (1, config.conv_L_cache - 1, config.hidden_size)
 
     class DummyLayer:
 
@@ -252,7 +252,7 @@ class PatchTest(parameterized.TestCase):
     )
     conv_composite.load_state_dict(conv_standard.state_dict())
 
-    expected_shape = (1, config.hidden_size, config.conv_L_cache - 1)
+    expected_shape = (1, config.conv_L_cache - 1, config.hidden_size)
 
     class DummyLayer:
 
@@ -305,7 +305,7 @@ class PatchTest(parameterized.TestCase):
     )
     conv_composite.load_state_dict(conv_standard.state_dict())
 
-    expected_shape = (1, config.hidden_size, config.conv_L_cache - 1)
+    expected_shape = (1, config.conv_L_cache - 1, config.hidden_size)
 
     class DummyLayer:
 
@@ -368,7 +368,7 @@ class PatchTest(parameterized.TestCase):
       def __init__(self, state):
         self.layers = [DummyLayer(state)]
 
-    init_state = torch.randn(1, config.hidden_size, config.conv_L_cache - 1)
+    init_state = torch.randn(1, config.conv_L_cache - 1, config.hidden_size)
     prefill_cache = DummyCache(init_state)
     decode_cache = DummyCache(init_state)
 
@@ -431,7 +431,7 @@ class PatchTest(parameterized.TestCase):
 
     args = (
         torch.randn(1, 4, config.hidden_size),
-        torch.randn(1, config.hidden_size, config.conv_L_cache - 1),
+        torch.randn(1, config.conv_L_cache - 1, config.hidden_size),
         torch.tensor([[True, True, True, False]]),
     )
     module = ConvWrapper().eval()
@@ -447,6 +447,8 @@ class PatchTest(parameterized.TestCase):
         b"odml.short_conv_step" in edge_model.model_content(),
         use_short_conv_composite,
     )
+    if use_short_conv_composite:
+      self.assertIn(b"channels_last", edge_model.model_content())
     outputs = edge_model(*(arg.numpy() for arg in args))
     if not isinstance(outputs, tuple):
       self.fail(f"Expected a tuple of outputs, got {type(outputs)}.")

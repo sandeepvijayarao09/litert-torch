@@ -303,10 +303,27 @@ class CacheTest(googletest.TestCase):
 
     conv_layer = kv_cache.layers[1]
     self.assertIsNotNone(conv_layer.recurrent_states)
-    self.assertEqual(conv_layer.conv_states.shape, (1, 2 * 16 * 2 + 4 * 16, 3))
+    self.assertEqual(conv_layer.conv_kernel_size, 3)
+    self.assertEqual(conv_layer.conv_states.shape, (1, 3, 2 * 16 * 2 + 4 * 16))
     self.assertEqual(conv_layer.recurrent_states.shape, (1, 4, 16, 16))
     self.assertEqual(conv_layer.conv_states.dtype, torch.float32)
     self.assertEqual(conv_layer.recurrent_states.dtype, torch.float32)
+
+    # Test channels-last update_conv_state (padded prefill + decode)
+    conv_dim = 2 * 16 * 2 + 4 * 16
+    prefill_x = torch.arange(6 * conv_dim, dtype=torch.float32).reshape(
+        1, 6, conv_dim
+    )
+    valid_mask = torch.tensor([[1, 1, 1, 1, 0, 0]], dtype=torch.bool)
+    conv_layer.update_conv_state(prefill_x, valid_mask=valid_mask)
+    torch.testing.assert_close(conv_layer.conv_states, prefill_x[:, 1:4, :])
+
+    decode_x = torch.full((1, 1, conv_dim), 7.0)
+    conv_layer.update_conv_state(decode_x)
+    torch.testing.assert_close(
+        conv_layer.conv_states,
+        torch.cat([prefill_x[:, 2:4, :], decode_x], dim=1),
+    )
 
     # Test that .to(torch.float16) keeps recurrent_states as float32
     conv_layer.to(torch.float16)
@@ -328,6 +345,7 @@ class CacheTest(googletest.TestCase):
     self.assertIsInstance(
         unflattened.layers[1], cache_lib.LiteRTLMConvCacheLayer
     )
+    self.assertEqual(unflattened.layers[1].conv_kernel_size, 3)
     self.assertTrue(
         torch.allclose(
             unflattened.layers[1].conv_states, conv_layer.conv_states
@@ -338,6 +356,53 @@ class CacheTest(googletest.TestCase):
             unflattened.layers[1].recurrent_states, conv_layer.recurrent_states
         )
     )
+
+  def test_lfm2_conv_cache_is_channels_last(self):
+    class MockLfm2Config:
+
+      def __init__(self):
+        self.num_hidden_layers = 2
+        self.layer_types = ["conv", "full_attention"]
+        self.hidden_size = 64
+        self.num_attention_heads = 4
+        self.num_key_value_heads = 2
+        self.head_dim = 16
+        self.conv_L_cache = 3
+
+    export_config = cache_lib.ExportableModuleConfig(
+        model="dummy_model",
+        cache_length=128,
+        batch_size=1,
+        k_ts_idx=2,
+        v_ts_idx=2,
+    )
+    kv_cache = cache_lib.LiteRTLMCache.create_from_config(
+        MockLfm2Config(), export_config
+    )
+    conv_layer = kv_cache.layers[0]
+    self.assertIsInstance(conv_layer, cache_lib.LiteRTLMConvCacheLayer)
+    self.assertIsNone(conv_layer.recurrent_states)
+    self.assertEqual(conv_layer.conv_kernel_size, 2)
+    self.assertEqual(conv_layer.conv_states.shape, (1, 2, 64))
+
+    # Padded prefill keeps the last 2 valid inputs; decode appends one.
+    prefill_x = torch.arange(5 * 64, dtype=torch.float32).reshape(1, 5, 64)
+    conv_layer.update_conv_state(
+        prefill_x, valid_mask=torch.tensor([[1, 1, 1, 0, 0]], dtype=torch.bool)
+    )
+    torch.testing.assert_close(conv_layer.conv_states, prefill_x[:, 1:3, :])
+    decode_x = torch.full((1, 1, 64), 7.0)
+    conv_layer.update_conv_state(decode_x)
+    torch.testing.assert_close(
+        conv_layer.conv_states,
+        torch.cat([prefill_x[:, 2:3, :], decode_x], dim=1),
+    )
+
+    # Channels-first inputs are rejected.
+    with self.assertRaises(ValueError):
+      conv_layer.update_conv_state(torch.zeros(1, 64, 1))
+    with self.assertRaises(ValueError):
+      cache_lib.LiteRTLMConvCacheLayer(torch.zeros(1, 64), layer_type="conv")
 
 
 if __name__ == "__main__":
