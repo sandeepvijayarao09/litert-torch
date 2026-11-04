@@ -123,20 +123,77 @@ def short_conv(
     c = None
     conv_input = in_proj_out
 
-  if in_proj_out.shape[1] == 1 and num_valid_tokens is None:
-    # Single-token decode: the depthwise conv is a multiply-add over the L
-    # taps. Reshapes instead of transposes keep it a direct dot product.
-    padded_input = torch.cat(
-        [conv_state, conv_input.squeeze(1).unsqueeze(-1)], dim=-1
-    )
-    next_state = padded_input[:, :, -conv_state.shape[-1] :]
+  channels_last = conv_state.shape[-1] == conv_input.shape[-1]
+  if channels_last:
+    state_len = conv_state.shape[1]
     w = conv_weight.squeeze(1) if conv_weight.dim() == 3 else conv_weight
-    conv_out = (padded_input * w.unsqueeze(0)).sum(dim=-1)
+    # Transpose weight [channels, L] -> [L, channels] if needed.
+    if w.dim() == 2 and w.shape[0] == conv_input.shape[-1]:
+      w = w.transpose(0, 1)
+    if w.dim() == 2:
+      w = w.unsqueeze(0)  # [1, L, channels]
+
+    if in_proj_out.shape[1] == 1 and num_valid_tokens is None:
+      # Single-token decode with NWC channels-last state [batch, state_len, channels].
+      # Compute taps directly with binary operations to avoid the need for slicing
+      # and concatenation.
+      conv_out = conv_state[:, 0, :] * w[:, 0, :]
+      for k in range(1, state_len):
+        conv_out = conv_out + conv_state[:, k, :] * w[:, k, :]
+      conv_out = conv_out + conv_input.squeeze(1) * w[:, state_len, :]
+      if conv_bias is not None:
+        conv_out = conv_out + conv_bias.unsqueeze(0)
+      if use_silu:
+        conv_out = F.silu(conv_out)
+      y = c * conv_out.unsqueeze(1) if c is not None else conv_out.unsqueeze(1)
+      if state_len > 1:
+        next_state = torch.cat([conv_state[:, 1:, :], conv_input], dim=1)
+      else:
+        next_state = conv_input
+      return y, next_state
+
+    # Prefill with NWC channels-last state [batch, state_len, channels].
+    padded = torch.cat([conv_state, conv_input], dim=1)
+    seq_len = in_proj_out.shape[1]
+    num_taps = w.shape[1]
+    conv_out = padded[:, 0 : seq_len, :] * w[:, 0 : 1, :]
+    for k in range(1, num_taps):
+      conv_out = conv_out + padded[:, k : k + seq_len, :] * w[:, k : k + 1, :]
+    if conv_bias is not None:
+      conv_out = conv_out + conv_bias.unsqueeze(0).unsqueeze(0)
+    if num_valid_tokens is None:
+      next_state = padded[:, seq_len : seq_len + state_len, :]
+    else:
+      indices = num_valid_tokens + torch.arange(
+          state_len, device=padded.device, dtype=torch.int32
+      )
+      next_state = torch.ops.tfl.gather(padded, indices, 1)
+    if use_silu:
+      conv_out = F.silu(conv_out)
+    y = c * conv_out if c is not None else conv_out
+    return y, next_state
+
+  if in_proj_out.shape[1] == 1 and num_valid_tokens is None:
+    # Single-token decode with NCW channels-first state [batch, channels, state_len].
+    # Compute taps directly with binary operations to avoid the need for slicing
+    # and concatenation.
+    state_len = conv_state.shape[-1]
+    w = conv_weight.squeeze(1) if conv_weight.dim() == 3 else conv_weight
+    conv_out = conv_state[:, :, 0] * w[:, 0]
+    for k in range(1, state_len):
+      conv_out = conv_out + conv_state[:, :, k] * w[:, k]
+    conv_out = conv_out + conv_input.squeeze(1) * w[:, state_len]
     if conv_bias is not None:
       conv_out = conv_out + conv_bias.unsqueeze(0)
     if use_silu:
       conv_out = F.silu(conv_out)
     y = c * conv_out.unsqueeze(1) if c is not None else conv_out.unsqueeze(1)
+    if state_len > 1:
+      next_state = torch.cat(
+          [conv_state[:, :, 1:], conv_input.squeeze(1).unsqueeze(-1)], dim=-1
+      )
+    else:
+      next_state = conv_input.squeeze(1).unsqueeze(-1)
     return y, next_state
 
   conv_out, next_state = causal_conv1d_with_state(
@@ -198,6 +255,8 @@ def apply_short_conv_step(
     attrs["is_gated"] = False
   if use_silu:
     attrs["use_silu"] = True
+  if conv_state.shape[1] < conv_state.shape[2]:
+    attrs["channels_last"] = True
   builder = composite.StableHLOCompositeBuilder(
       name="odml.short_conv_step", attr=attrs
   )

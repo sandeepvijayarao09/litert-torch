@@ -502,7 +502,12 @@ class LiteRTLMConvCacheLayer(
     self.is_recurrent_states_initialized: Any = recurrent_states is not None
     self.batch_size = batch_size
     self.is_initialized = True
-    self.conv_kernel_size: int = conv_states.shape[-1]
+    if conv_states.shape[1] <= 16 and conv_states.shape[-1] > 16:
+      self.channels_last = True
+      self.conv_kernel_size: int = conv_states.shape[1] + 1
+    else:
+      self.channels_last = False
+      self.conv_kernel_size: int = conv_states.shape[-1]
     self.keys = torch.zeros((1, 1, 1, 1))
     self.values = torch.zeros((1, 1, 1, 1))
     self.layer_type = layer_type
@@ -530,6 +535,24 @@ class LiteRTLMConvCacheLayer(
       conv_states: torch.Tensor,
       state_idx: int = 0,
       **kwargs) -> torch.Tensor:
+    if getattr(self, "channels_last", False):
+      seq_len = conv_states.shape[1]
+      state_len = self.conv_states.shape[1]
+      padded_input = torch.cat([self.conv_states, conv_states], dim=1)
+      if seq_len > 1:
+        valid_mask = kwargs.get("valid_mask", None)
+        if valid_mask is not None:
+          indices = valid_mask.to(torch.int32).sum() + torch.arange(
+              state_len, device=padded_input.device, dtype=torch.int32
+          )
+          next_state = torch.index_select(padded_input, 1, indices)
+        else:
+          next_state = padded_input[:, seq_len : seq_len + state_len, :]
+      else:
+        next_state = padded_input[:, 1:, :]
+      self.conv_states.copy_(next_state)
+      return self.conv_states
+
     seq_len = conv_states.shape[-1]
     cache_kwargs = self.get_cache_runtime_args()
     cache_position = cache_kwargs.get("cache_position", None)
@@ -638,7 +661,7 @@ class LiteRTLMConvCacheLayer(
       )
       conv_dim = key_dim * 2 + value_dim
       conv_cache_len = model_config.linear_conv_kernel_dim - 1
-      c_state_shape = (batch_size, conv_dim, conv_cache_len)
+      c_state_shape = (batch_size, conv_cache_len, conv_dim)
       r_state_shape = (
           batch_size,
           model_config.linear_num_value_heads,
